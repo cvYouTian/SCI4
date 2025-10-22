@@ -13,6 +13,7 @@ import time
 
 try:
     from thop import profile, clever_format
+
     THOP_AVAILABLE = True
 except ImportError:
     print("Warning: thop not installed,Please install it with pip install thop")
@@ -36,6 +37,7 @@ def parse_args():
     # 设置数据集的绝对路径
     parser.add_argument('--dataset-dir', type=str,
                         default='/home/tian/Documents/datasets/IRSTD-1k')
+    parser.add_argument("--root-dir", type=str, default="/home/tian/Documents/development/repos/SCI4")
     parser.add_argument('--batch-size', type=int, default=4)
     parser.add_argument('--epochs', type=int, default=400)
     parser.add_argument('--lr', type=float, default=0.05)
@@ -108,7 +110,7 @@ class Get_gradientmask_nopadding(nn.Module):
             self.weight_v = nn.Parameter(data=kernel_v, requires_grad=False).cpu()
 
     def forward(self, x):
-        
+
         x0 = x[:, 0]
         x0_v = F.conv2d(x0.unsqueeze(1), self.weight_v, padding=1)
         x0_h = F.conv2d(x0.unsqueeze(1), self.weight_h, padding=1)
@@ -134,6 +136,7 @@ class Trainer:
         self.device = device
 
         self.grad = Get_gradient_nopadding()
+        # self.grad =LoGFilter()
         self.grad_mask = Get_gradientmask_nopadding()
 
         model = TGRS(3)
@@ -150,6 +153,7 @@ class Trainer:
         self.down = nn.MaxPool2d(2, 2)
         self.loss_fun = SLSIoULoss()
         self.PD_FA = PD_FA(1, 10, args.base_size)
+        # self.PD_FA = PD_FA(1, 10)
         self.mIoU = mIoU(1)
         self.nIoU_metric = SamplewiseSigmoidMetric(1, score_thresh=0.5)
         self.ROC = ROCMetric(1, 10)
@@ -166,7 +170,7 @@ class Trainer:
                 self.best_iou = checkpoint['iou']
                 self.save_folder = check_folder
             else:
-                self.save_folder = '/home/tian/Documents/development/repos/TGRS2025/weight/Net-%s' % (
+                self.save_folder = self.args.root_dir + os.sep + 'weight/Net-%s' % (
                     time.strftime('%Y-%m-%d-%H-%M-%S', time.localtime(time.time())))
                 self.save_folder = Path(self.save_folder)
                 if not self.save_folder.exists():
@@ -194,9 +198,11 @@ class Trainer:
             try:
                 # 创建输入
                 input_shape = (1, 3, self.args.crop_size, self.args.crop_size)
+                edge_shape = (1, 3, self.args.crop_size, self.args.crop_size)
 
                 # 创建dummy输入
                 dummy_input = torch.randn(input_shape)
+                dummy_edge = torch.randn(edge_shape)
 
                 # 将模型设置成评估模式并移动到CPU上进行计算
                 model_copy = type(self.model.module if hasattr(self.model, "module") else self.model)(3)
@@ -207,7 +213,7 @@ class Trainer:
                 model_copy.eval()
 
                 # 计算FLOPs和参数量
-                flops, params = profile(model_copy, inputs=(dummy_input, False))
+                flops, params = profile(model_copy, inputs=(dummy_input, dummy_edge, False))
                 flops, params = clever_format([flops, params], "%.3f")
 
                 print(f"GFLOPs: {flops}")
@@ -228,11 +234,17 @@ class Trainer:
         for i, (data, mask, edge_ori) in enumerate(tbar):
             data = data.to(self.device)
             labels = mask.to(self.device)
+            # edge_ori = edge_ori.to(self.device)
+
+            # 对数据进行边缘特征的提取
+            edge_in = self.grad(data)
+            # 对mask进行边缘信息的提取,得到的edg_gt
+            # edge_gt = self.grad_mask(edge_ori)
 
             if epoch > self.warm_epoch:
                 tag = True
 
-            masks, pred = self.model(data, tag)
+            masks, pred = self.model(data, edge_in, tag)
             loss = 0
 
             loss = loss + self.loss_fun(pred, labels, self.warm_epoch, epoch)
@@ -269,11 +281,12 @@ class Trainer:
             with torch.no_grad():
                 data = data.to(self.device)
                 mask = mask.to(self.device)
+                edge_in = self.grad(data)
 
                 if epoch > self.warm_epoch:
                     tag = True
 
-                _, pred = self.model(data, tag)
+                _, pred = self.model(data, edge_in, tag)
 
             self.mIoU.update((pred > 0.5).float(), mask)
             self.nIoU_metric.update((pred > 0.5).float(), mask)
@@ -316,7 +329,7 @@ class Trainer:
                     format(time.strftime('%Y-%m-%d-%H-%M-%S', time.localtime(time.time())),
                            epoch, IoU, nIoU, PD[0], FA[0] * 1e6))
 
-            torch.save(self.model.state_dict(), self.save_folder +'/last.pkl')
+            torch.save(self.model.state_dict(), self.save_folder + '/last.pkl')
 
         elif self.mode == 'test':
             print('IoU: ' + str(IoU) + '\n')
